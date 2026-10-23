@@ -5,14 +5,22 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+import hashlib
+import json
 import os
 from pathlib import Path
+import secrets
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+teacher_auth = HTTPBasic(auto_error=False)
+teacher_credentials_file = Path(__file__).with_name("teachers.json")
+password_hash_iterations = 310_000
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -78,9 +86,75 @@ activities = {
 }
 
 
+def hash_teacher_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"),
+        password_hash_iterations
+    ).hex()
+
+
+def get_teacher_accounts() -> dict[str, dict[str, str]]:
+    with teacher_credentials_file.open(encoding="utf-8") as credentials_file:
+        data = json.load(credentials_file)
+
+    if not isinstance(data, dict) or not isinstance(data.get("teachers"), list):
+        raise RuntimeError("teachers.json must contain a 'teachers' list")
+
+    accounts: dict[str, dict[str, str]] = {}
+    for teacher in data["teachers"]:
+        if not isinstance(teacher, dict):
+            raise RuntimeError("Each teacher account must be a JSON object")
+
+        username = teacher.get("username")
+        salt = teacher.get("salt")
+        password_hash = teacher.get("password_hash")
+        if not all(isinstance(value, str) and value for value in
+                   (username, salt, password_hash)):
+            raise RuntimeError(
+                "Each teacher account must include username, salt, and password_hash"
+            )
+        if username in accounts:
+            raise RuntimeError(f"Duplicate teacher username: {username}")
+
+        accounts[username] = {"salt": salt, "password_hash": password_hash}
+
+    return accounts
+
+
+def require_teacher(
+    credentials: HTTPBasicCredentials | None = Depends(teacher_auth),
+) -> str:
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Teacher login required",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    accounts = get_teacher_accounts()
+    account = accounts.get(credentials.username)
+    salt = account["salt"] if account else "0" * 32
+    expected_hash = account["password_hash"] if account else "0" * 64
+    supplied_hash = hash_teacher_password(credentials.password, salt)
+
+    if not secrets.compare_digest(supplied_hash, expected_hash):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid teacher credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    return credentials.username
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
+
+
+@app.get("/auth/verify")
+def verify_teacher(teacher: str = Depends(require_teacher)):
+    return {"username": teacher}
 
 
 @app.get("/activities")
@@ -89,7 +163,9 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str, email: str, _: str = Depends(require_teacher)
+):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +187,9 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str, email: str, _: str = Depends(require_teacher)
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
